@@ -4,5 +4,5 @@ pandas
 numpy
 matplotlib
 seaborn
-tensorflow
+tensorflow>=2.16
 h5py
