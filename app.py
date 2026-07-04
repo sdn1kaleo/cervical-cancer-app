@@ -18,7 +18,6 @@ from sklearn.metrics import (
     precision_score, recall_score, f1_score
 )
 from sklearn.impute import SimpleImputer
-from tensorflow.keras.models import load_model as keras_load_model, model_from_json
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -72,7 +71,15 @@ def load_cnn_model(uploaded_file):
       1. File .h5 / .keras asli
       2. File .pkl yang sebenarnya berformat HDF5 (rename biasa)
       3. File .pkl hasil pickle.dump(model) atau pickle.dump({'architecture', 'weights'})
+
+    NOTE: tensorflow di-import di dalam fungsi ini (lazy import), bukan di
+    top-level file, supaya app tidak wajib me-load TensorFlow (yang berat dan
+    boros memori) saat user hanya memakai model sklearn biasa (Random Forest,
+    Gradient Boosting, dll). Ini penting terutama di Streamlit Community Cloud
+    yang resource RAM-nya terbatas.
     """
+    from tensorflow.keras.models import load_model as keras_load_model, model_from_json
+
     suffix = os.path.splitext(uploaded_file.name)[1] or ".h5"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(uploaded_file.getbuffer())
