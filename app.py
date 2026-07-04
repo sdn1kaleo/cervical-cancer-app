@@ -3,6 +3,10 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+import pickle
+import tempfile
+import os
+import h5py
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.svm import SVC
@@ -14,6 +18,7 @@ from sklearn.metrics import (
     precision_score, recall_score, f1_score
 )
 from sklearn.impute import SimpleImputer
+from tensorflow.keras.models import load_model as keras_load_model, model_from_json
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -37,6 +42,70 @@ st.markdown("""
 st.title("🏥 Cervical Cancer Risk Prediction")
 st.markdown("Aplikasi prediksi risiko kanker serviks menggunakan Machine Learning.")
 st.markdown("---")
+
+# ── CNN Wrapper & Loader ───────────────────────────────────────────────────────
+class KerasCNNWrapper:
+    """Membungkus model Keras CNN agar punya interface predict/predict_proba
+    seperti model sklearn, sehingga bisa dipakai langsung di seluruh dashboard
+    tanpa mengubah kode evaluasi/prediksi yang sudah ada."""
+
+    def __init__(self, keras_model):
+        self.model = keras_model
+        self.classes_ = np.array([0, 1])
+
+    def _reshape(self, X):
+        X_arr = np.asarray(X)
+        return X_arr.reshape(X_arr.shape[0], X_arr.shape[1], 1)
+
+    def predict_proba(self, X):
+        prob_pos = self.model.predict(self._reshape(X), verbose=0).flatten()
+        prob_pos = np.clip(prob_pos, 0.0, 1.0)
+        return np.column_stack([1 - prob_pos, prob_pos])
+
+    def predict(self, X):
+        return (self.predict_proba(X)[:, 1] > 0.5).astype(int)
+
+
+def load_cnn_model(uploaded_file):
+    """Load model CNN dari file yang diupload user.
+    Mendukung 3 kemungkinan format:
+      1. File .h5 / .keras asli
+      2. File .pkl yang sebenarnya berformat HDF5 (rename biasa)
+      3. File .pkl hasil pickle.dump(model) atau pickle.dump({'architecture', 'weights'})
+    """
+    suffix = os.path.splitext(uploaded_file.name)[1] or ".h5"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(uploaded_file.getbuffer())
+        tmp_path = tmp.name
+
+    try:
+        # Kasus 1 & 2: file berformat HDF5 (baik ekstensi .h5/.keras maupun .pkl)
+        if h5py.is_hdf5(tmp_path):
+            keras_model = keras_load_model(tmp_path)
+            return KerasCNNWrapper(keras_model)
+
+        # Kasus 3: file hasil pickle.dump()
+        with open(tmp_path, "rb") as f:
+            obj = pickle.load(f)
+
+        # 3a. Objek yang sudah punya method predict (misal berhasil di-pickle utuh)
+        if hasattr(obj, "predict"):
+            return KerasCNNWrapper(obj)
+
+        # 3b. Dict berisi arsitektur (json) + bobot
+        if isinstance(obj, dict) and "architecture" in obj and "weights" in obj:
+            keras_model = model_from_json(obj["architecture"])
+            keras_model.set_weights(obj["weights"])
+            return KerasCNNWrapper(keras_model)
+
+        raise ValueError(
+            "Format file model CNN tidak dikenali. Pastikan file disimpan dengan "
+            "model.save('nama.h5') atau pickle.dump({'architecture': model.to_json(), "
+            "'weights': model.get_weights()}, f)."
+        )
+    finally:
+        os.remove(tmp_path)
+
 
 # ── Load & Preprocess ─────────────────────────────────────────────────────────
 @st.cache_data
@@ -67,8 +136,28 @@ with st.sidebar:
     st.markdown("---")
     model_choice = st.selectbox(
         "Pilih Algoritma",
-        ["Random Forest ⭐ (Rekomendasi)", "Gradient Boosting", "Logistic Regression", "SVM"]
+        ["Random Forest ⭐ (Rekomendasi)", "Gradient Boosting", "Logistic Regression",
+         "SVM", "CNN (Deep Learning)"]
     )
+
+    cnn_file = None
+    cnn_use_scaling = False
+    if "CNN" in model_choice:
+        st.markdown("**📦 Upload Model CNN**")
+        cnn_file = st.file_uploader(
+            "File model CNN (.pkl / .h5 / .keras)",
+            type=["pkl", "h5", "keras"],
+            key="cnn_uploader"
+        )
+        cnn_use_scaling = st.checkbox(
+            "Model dilatih dengan StandardScaler",
+            value=False,
+            help=("Kosongkan (default) jika CNN dilatih langsung dari data mentah "
+                  "seperti pada skrip training awal (X_train.values). Centang jika "
+                  "kamu men-scale data sebelum training CNN.")
+        )
+
+    st.markdown("---")
     test_size = st.slider("Ukuran Test Set (%)", 10, 40, 20) / 100
     st.markdown("---")
     st.markdown("**ℹ️ Info Dataset**")
@@ -129,7 +218,7 @@ with tab2:
     st.subheader("Pelatihan & Evaluasi Model")
 
     @st.cache_resource
-    def train_model(model_name, test_sz):
+    def train_model(model_name, test_sz, _cnn_file, cnn_scaling):
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=test_sz, random_state=42, stratify=y
         )
@@ -137,6 +226,22 @@ with tab2:
         X_train_s = scaler.fit_transform(X_train)
         X_test_s  = scaler.transform(X_test)
 
+        # ── Cabang khusus CNN: load model pretrained, tidak training ulang ──
+        if "CNN" in model_name:
+            if _cnn_file is None:
+                return None, scaler, X_train, X_test, y_train, y_test, None, None, None
+
+            model = load_cnn_model(_cnn_file)
+            X_train_input = X_train_s if cnn_scaling else X_train.values
+            X_test_input  = X_test_s  if cnn_scaling else X_test.values
+
+            y_pred = model.predict(X_test_input)
+            y_prob = model.predict_proba(X_test_input)[:, 1]
+            # CNN sudah pretrained -> tidak di-cross-validate ulang, hanya evaluasi test set
+            cv_scores = np.array([roc_auc_score(y_test, y_prob)])
+            return model, scaler, X_train, X_test, y_train, y_test, y_pred, y_prob, cv_scores
+
+        # ── Cabang model sklearn (seperti semula) ──
         if "Random Forest" in model_name:
             model = RandomForestClassifier(n_estimators=200, max_depth=10,
                                            class_weight="balanced", random_state=42)
@@ -155,8 +260,13 @@ with tab2:
 
         return model, scaler, X_train, X_test, y_train, y_test, y_pred, y_prob, cv_scores
 
-    with st.spinner("Melatih model…"):
-        model, scaler, X_train, X_test, y_train, y_test, y_pred, y_prob, cv_scores = train_model(model_choice, test_size)
+    with st.spinner("Memuat / melatih model…"):
+        (model, scaler, X_train, X_test, y_train, y_test,
+         y_pred, y_prob, cv_scores) = train_model(model_choice, test_size, cnn_file, cnn_use_scaling)
+
+    if model is None:
+        st.warning("⚠️ Silakan upload file model CNN (.pkl / .h5 / .keras) terlebih dahulu di sidebar untuk melanjutkan.")
+        st.stop()
 
     acc  = accuracy_score(y_test, y_pred)
     prec = precision_score(y_test, y_pred, zero_division=0)
@@ -195,7 +305,11 @@ with tab2:
     with st.expander("📋 Laporan Klasifikasi Lengkap"):
         report = classification_report(y_test, y_pred, target_names=["Negatif","Positif"])
         st.code(report)
-        st.info(f"Cross-Validation ROC-AUC (5-fold): {cv_scores.mean():.3f} ± {cv_scores.std():.3f}")
+        if "CNN" in model_choice:
+            st.info(f"ROC-AUC pada test set: {cv_scores.mean():.3f} "
+                    "(model CNN pretrained, tidak melalui cross-validation ulang).")
+        else:
+            st.info(f"Cross-Validation ROC-AUC (5-fold): {cv_scores.mean():.3f} ± {cv_scores.std():.3f}")
 
 # ════════════════════════════════════════════════════════════════════════════
 # TAB 3 – Feature Importance
@@ -220,6 +334,12 @@ with tab3:
         ax.set_title("Top 15 Fitur (Logistic Regression)")
         ax.spines[["top","right"]].set_visible(False)
         st.pyplot(fig)
+    elif "CNN" in model_choice:
+        st.info(
+            "Feature importance tidak tersedia secara langsung untuk model CNN. "
+            "Untuk interpretasi fitur pada deep learning, pertimbangkan menggunakan "
+            "teknik tambahan seperti SHAP atau permutation importance."
+        )
     else:
         st.info("Feature importance tidak tersedia untuk SVM. Gunakan Random Forest atau Gradient Boosting.")
 
@@ -268,9 +388,15 @@ with tab4:
             "STDs (number)": stds_num,
         })
         input_df = pd.DataFrame([row])[X.columns]
-        input_scaled = scaler.transform(input_df)
-        prob = model.predict_proba(input_scaled)[0][1]
-        pred = model.predict(input_scaled)[0]
+
+        # Untuk CNN, ikuti pengaturan scaling yang sama seperti saat evaluasi
+        if "CNN" in model_choice and not cnn_use_scaling:
+            input_processed = input_df.values
+        else:
+            input_processed = scaler.transform(input_df)
+
+        prob = model.predict_proba(input_processed)[0][1]
+        pred = model.predict(input_processed)[0]
 
         st.markdown("---")
         if pred == 1:
